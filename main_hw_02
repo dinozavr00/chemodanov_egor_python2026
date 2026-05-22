@@ -1,0 +1,178 @@
+import gspread
+from flask import Flask, request, jsonify, Response
+from typing import Dict, List, Union, Tuple, Optional
+import json
+from flask import make_response
+
+SPREADSHEET_ID = '1Jl0OhcH-LhXsI9fIo58pIfEPMrOuBKUHLq_-udr7OjA'
+
+app = Flask(__name__)
+app.config['JSON_AS_ASCII'] = False
+
+def load_data() -> Tuple[Dict[Tuple[str, int], dict], Dict[int, dict]]:
+    gc = gspread.service_account(filename='googleapi.json')
+    sh = gc.open_by_key(SPREADSHEET_ID)
+
+    students_data: Dict[Tuple[str, int], dict] = {}
+    
+    # ---- Листы с домашками ----
+    for worksheet in sh.worksheets():
+        hw_name = worksheet.title
+        if hw_name == 'Итог':
+            continue
+        values = worksheet.get_all_values()
+        if not values:
+            continue
+        headers = values[0]
+        if not all(col in headers for col in ['ФИ', 'Группа', 'Баллы']):
+            print(f"Лист {hw_name} пропущен: нет нужных колонок")
+            continue
+        try:
+            idx_name = headers.index('ФИ')
+            idx_group = headers.index('Группа')
+            idx_score = headers.index('Баллы')
+        except ValueError:
+            continue
+        for row in values[1:]:
+            if len(row) <= max(idx_name, idx_group, idx_score):
+                continue
+            name = row[idx_name].strip()
+            if not name:
+                continue
+            group_id = int(row[idx_group].strip())
+            score = int(row[idx_score].strip()) if row[idx_score].strip() else 0
+            key = (name, group_id)
+            if key not in students_data:
+                students_data[key] = {
+                    'name': name,
+                    'group_id': group_id,
+                    'scores': {},
+                    'total_score': 0,
+                    'final_mark': None
+                }
+            students_data[key]['scores'][hw_name] = score
+    
+    # ---- total_score и final_mark ----
+    for student in students_data.values():
+        total = sum(student['scores'].values())
+        student['total_score'] = total
+        if total >= 51:
+            student['final_mark'] = 5
+        elif total >= 31:
+            student['final_mark'] = 4
+        else:
+            student['final_mark'] = 3
+    
+    # ---- Допустим у нас есть student_id и словарь students_by_id ----
+    students_by_id: Dict[int, dict] = {}
+    sorted_keys = sorted(students_data) 
+    for idx, key in enumerate(sorted_keys, start=1):
+        student = students_data[key]
+        student['student_id'] = idx
+        students_by_id[idx] = student
+    return students_data, students_by_id
+
+STUDENTS_DATA, STUDENTS_BY_ID = load_data()
+
+@app.route('/names')
+def get_names():
+    unique_names = list({s['name'] for s in STUDENTS_DATA.values()})
+    response = make_response(json.dumps({'names': unique_names}, ensure_ascii=False))
+    response.mimetype = 'application/json; charset=utf-8'
+    return response
+
+@app.route('/<hw_name>/mean_score')
+def get_mean_score_all(hw_name: str):
+    scores = []
+    for s in STUDENTS_DATA.values():
+        if hw_name in s['scores']:
+            scores.append(s['scores'][hw_name])
+    if not scores:
+        return {'error': f'No data for {hw_name}'}, 404
+    mean = sum(scores)/len(scores)
+    return {'mean_score': round(mean,2)}, 200
+
+@app.route('/<hw_name>/<group_id>/mean_score')
+def get_mean_score_group(hw_name: str, group_id: str):
+    try:
+        gid = int(group_id)
+    except:
+        return {'error': 'Invalid group_id'}, 400
+    scores = []
+    for s in STUDENTS_DATA.values():
+        if s['group_id'] == gid and hw_name in s['scores']:
+            scores.append(s['scores'][hw_name])
+    if not scores:
+        return {'error': f'No data for {hw_name} in group {group_id}'}, 404
+    mean = sum(scores)/len(scores)
+    return {'mean_score': round(mean,2)}, 200
+
+@app.route('/mean_score')
+def get_mean_score_query():
+    group_id = request.args.get('group_id')
+    hw_name = request.args.get('hw_name')
+    if not group_id or not hw_name:
+        return {'error': 'Missing group_id or hw_name'}, 400
+    try:
+        gid = int(group_id)
+    except:
+        return {'error': 'Invalid group_id'}, 400
+    scores = []
+    for s in STUDENTS_DATA.values():
+        if s['group_id'] == gid and hw_name in s['scores']:
+            scores.append(s['scores'][hw_name])
+    if not scores:
+        return {'error': f'No data for {hw_name} in group {group_id}'}, 404
+    mean = sum(scores)/len(scores)
+    return {'mean_score': round(mean,2)}, 200
+
+@app.route('/mark')
+def get_mark():
+    student_id = request.args.get('student_id')
+    group_id = request.args.get('group_id')
+    if student_id:
+        try:
+            sid = int(student_id)
+        except:
+            return {'error': 'Invalid student_id'}, 400
+        student = STUDENTS_BY_ID.get(sid)
+        if not student:
+            return {'error': f'Student {sid} not found'}, 404
+        return {'mark': student['final_mark']}, 200
+    elif group_id:
+        try:
+            gid = int(group_id)
+        except:
+            return {'error': 'Invalid group_id'}, 400
+        marks = [s['final_mark'] for s in STUDENTS_DATA.values() if s['group_id'] == gid and s['final_mark'] is not None]
+        if not marks:
+            return {'error': f'No marks for group {group_id}'}, 404
+        avg_mark = sum(marks) / len(marks)
+        return {'average_mark': round(avg_mark,2)}, 200
+    else:
+        return {'error': 'Provide student_id or group_id'}, 400
+
+@app.route('/course_table')
+def course_table():
+    hw_name = request.args.get('hw_name')
+    if not hw_name:
+        return 'Missing hw_name', 400
+    group_id = request.args.get('group_id')
+    rows = []
+    for key, s in STUDENTS_DATA.items():
+        if group_id and s['group_id'] != int(group_id):
+            continue
+        score = s['scores'].get(hw_name)
+        if score is not None:
+            rows.append((s['name'], s['group_id'], score))
+    rows.sort(key=lambda x: x[0])  # сортировка по имени
+    html = '<html><body><table border="1">'
+    html += '<tr><th>Имя</th><th>Группа</th><th>Балл</th></tr>'
+    for name, gid, score in rows:
+        html += f'<tr><td>{name}</td><td>{gid}</td><td>{score}</td></tr>'
+    html += '</table></body></html>'
+    return html, 200
+
+if __name__ == '__main__':
+    print(f"Loaded {len(STUDENTS_DATA)} students")
+    app.run(host='0.0.0.0', port=1337, debug=True)
